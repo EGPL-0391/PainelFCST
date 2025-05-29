@@ -1,0 +1,111 @@
+import pandas as pd
+import plotly.express as px
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from dash import Dash, dcc, html, Input, Output
+import dash_bootstrap_components as dbc
+import os
+
+# === Caminho do arquivo ===
+base_dir = os.path.dirname(os.path.abspath(__file__))
+arquivo = os.path.join(base_dir, 'data', 'base_vendas_24.xlsx')
+
+if not os.path.exists(arquivo):
+    raise FileNotFoundError(f"Arquivo não encontrado: {arquivo}")
+
+# === Carregar e tratar os dados ===
+df = pd.read_excel(arquivo, sheet_name='Base vendas')
+df.columns = df.columns.str.strip()
+df['Emissao'] = pd.to_datetime(df['Emissao'], errors='coerce')
+df = df.dropna(subset=['Emissao', 'Cliente', 'Produto', 'Quantidade'])
+df['AnoMes'] = df['Emissao'].dt.to_period('M').dt.to_timestamp()
+df['Cliente'] = df['Cliente'].astype(str)
+df['Produto'] = df['Produto'].astype(str)
+df = df[df['AnoMes'] >= '2024-01-01']
+
+# === Agrupar dados ===
+agrupado = df.groupby(['Cliente', 'Produto', 'AnoMes'])['Quantidade'].sum().reset_index()
+
+# === Função de previsão ===
+def prever(cliente, produto):
+    dados = agrupado[(agrupado['Cliente'] == cliente) & (agrupado['Produto'] == produto)].copy()
+    dados = dados.sort_values('AnoMes')
+    dados['Previsao'] = 'Histórico'
+
+    if dados.empty:
+        return dados, "Sem dados suficientes para previsão."
+
+    serie = dados.set_index('AnoMes')['Quantidade']
+    
+    # Preencher índice para frequência mensal regular
+    serie.index = pd.date_range(start=serie.index.min(), periods=len(serie), freq='MS')
+
+    try:
+        modelo = ExponentialSmoothing(serie, trend='add', seasonal=None, initialization_method='estimated')
+        ajuste = modelo.fit()
+        previsao = ajuste.forecast(12).round().astype(int)
+
+        previsao = previsao.reset_index()
+        previsao.columns = ['AnoMes', 'Quantidade']
+        previsao['Cliente'] = cliente
+        previsao['Produto'] = produto
+        previsao['Previsao'] = 'Previsão'
+
+        df_plot = pd.concat([dados, previsao], ignore_index=True)
+        return df_plot, None
+
+    except Exception:
+        # Caso a previsão falhe, retorna apenas histórico
+        return dados, "Não foi possível gerar previsão (modelo não convergiu)."
+
+# === Dash App ===
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+clientes = sorted(agrupado['Cliente'].unique())
+produtos_por_cliente = agrupado.groupby('Cliente')['Produto'].unique().apply(list).to_dict()
+
+app.layout = dbc.Container([
+    html.H2("Painel de Vendas e Previsão"),
+    dbc.Row([
+        dbc.Col([
+            html.Label("Cliente:"),
+            dcc.Dropdown(id='dropdown-cliente', options=[{'label': c, 'value': c} for c in clientes], value=clientes[0])
+        ], width=6),
+        dbc.Col([
+            html.Label("Produto:"),
+            dcc.Dropdown(id='dropdown-produto')
+        ], width=6)
+    ]),
+    html.Br(),
+    dcc.Graph(id='grafico-vendas'),
+    html.Div(id='mensagem-erro', style={'color': 'red'})
+])
+
+@app.callback(
+    Output('dropdown-produto', 'options'),
+    Output('dropdown-produto', 'value'),
+    Input('dropdown-cliente', 'value')
+)
+def atualizar_produtos(cliente):
+    produtos = produtos_por_cliente.get(cliente, [])
+    return [{'label': p, 'value': p} for p in produtos], produtos[0] if produtos else None
+
+@app.callback(
+    Output('grafico-vendas', 'figure'),
+    Output('mensagem-erro', 'children'),
+    Input('dropdown-cliente', 'value'),
+    Input('dropdown-produto', 'value')
+)
+def atualizar_grafico(cliente, produto):
+    df_plot, erro = prever(cliente, produto)
+
+    if df_plot.empty:
+        return px.line(title="Sem dados"), erro
+
+    fig = px.line(df_plot, x='AnoMes', y='Quantidade', color='Previsao', title=f"{cliente} - {produto}", markers=True)
+    fig.update_layout(xaxis_title='Mês', yaxis_title='Quantidade Vendida')
+    return fig, erro
+
+# === Rodar o App ===
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 8050))
+    app.run(host='0.0.0.0', port=port)
